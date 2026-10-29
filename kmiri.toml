@@ -1,0 +1,9 @@
+page_table = true
+total_mem_size = 0x800_0000
+
+[layout]
+__generic_interrupts_start = 0x20a18
+__generic_interrupts_end = 0x21118
+__the_wrapped_rdmsr_instr = 0x6ec44
+__the_wrapped_wrmsr_instr = 0x6ec21
+enter_usermode = 0x2d353
