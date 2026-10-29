@@ -17,7 +17,7 @@
     "os": "none",
     "position-independent-executables": false,
     "relocation-model": "static",
-    "rustc-abi": "x86-softfloat",
+    "rustc-abi": "softfloat",
     "target-c-int-width": 32,
     "target-endian": "little",
     "target-pointer-width": 64,
