@@ -170,7 +170,7 @@ impl<A: Arch> Machine<A> {
     fn read_phys<T>(&self, phys: PhysicalAddress) -> T {
         let size = mem::size_of::<T>();
         if phys.add(size).data() <= self.memory.len() {
-            unsafe { ptr::read(self.memory.as_ptr().add(phys.data()) as *const T) }
+            unsafe { ptr::read_unaligned(self.memory.as_ptr().add(phys.data()) as *const T) }
         } else {
             panic!(
                 "read_phys: 0x{:X} size 0x{:X} outside of memory",
@@ -184,7 +184,7 @@ impl<A: Arch> Machine<A> {
         let size = mem::size_of::<T>();
         if phys.add(size).data() <= self.memory.len() {
             unsafe {
-                ptr::write(self.memory.as_mut_ptr().add(phys.data()) as *mut T, value);
+                ptr::write_unaligned(self.memory.as_mut_ptr().add(phys.data()) as *mut T, value);
             }
         } else {
             panic!(
