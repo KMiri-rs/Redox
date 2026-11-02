@@ -23,6 +23,7 @@
 - [KERNEL_SEPARATE_TABLE（内核独立页表）](#kernel_separate_table内核独立页表)
 - [PageMapper::visit](#pagemappervisit)
 - [PageTable::index_of](#pagetableindex_of)
+- [PageTable::next](#pagetablenext)
 - [main.rs::new_tables（引导流程）](#mainrsnew_tables引导流程)
 - [跨函数的几个概念](#跨函数的几个概念)
 - [代码质量观察（命名问题）](#代码质量观察命名问题)
@@ -683,6 +684,90 @@ PT 2^21），减 1 得区间末端偏移。`base ≤ address ≤ base + level_ma
 
 ---
 
+## PageTable::next
+
+`src/page/table.rs` 第 82–94 行。
+
+```rust
+pub unsafe fn next(&self, i: usize) -> Option<Self> {
+    if self.level == 0 {
+        return None;
+    }
+
+    unsafe {
+        Some(PageTable::new(
+            self.entry_base(i)?,
+            self.entry(i)?.address().ok()?,
+            self.level - 1,
+        ))
+    }
+}
+```
+
+**职责**：沿多级页表「向下走一级」——取出本页表第 `i` 项指向的下一级页表，构造并返回
+一个描述它的 `PageTable` 游标。这是 `map_phys` / `visit` / `unmap_phys_inner` 逐级下钻
+的统一封装。
+
+`PageTable<A>`（table.rs 第 5–10 行）是「某一级页表」的轻量句柄：`base` 是它覆盖的
+虚拟地址起点，`phys` 是这一级页表所在的物理地址，`level` 是层级（越深值越小，0 = 叶子
+级）。`next(i)` 返回的就是第 `i` 项指向的那张子表的句柄。
+
+### 逐行拆解
+
+1. **`if self.level == 0 { return None; }`** — `level == 0` 是最后一级（叶子级），每一项
+   指向的是普通物理页（或大页），不是下一级页表，所以不存在「下一级」，直接 `None`。
+
+2. **`self.entry_base(i)?`** — 第 `i` 项管辖的起始虚拟地址，作为子表的 `base`：
+
+   ```rust
+   let level_shift = self.level * A::PAGE_ENTRY_SHIFT + A::PAGE_SHIFT;
+   Some(self.base.add(i << level_shift))
+   ```
+
+   本级每项覆盖 `2^level_shift` 字节，第 `i` 项覆盖 `[base + i·2^level_shift, base +
+   (i+1)·2^level_shift)`。这个下界就是下一级页表的 `base`。
+
+3. **`self.entry(i)?.address().ok()?`** — 读取第 `i` 个 PTE 指向的物理地址：
+
+   - `entry(i)`（第 51–56 行）把 `self.phys` 经 `A::phys_to_virt` 转成虚拟地址，加上
+     `i * A::PAGE_ENTRY_SIZE` 读出一个 `usize` 得到 `PageEntry`；
+   - `address()`（entry.rs 第 33–44 行）从 PTE 地址字段解码物理地址，**present 才返回
+     `Ok`，否则 `Err`**；
+   - `.ok()?` 把 `Err` 转成 `None` —— PTE 的 present 位没置位说明子表尚未分配。
+
+   因此 `next` 是**尽力探测**而非断言：`i` 越界（`entry_base`/`entry` 的 `?`）、PTE
+   不存在、或 `level == 0`，任何一环都返回 `None` 而不是 panic。
+
+4. **`self.level - 1`** — 子表层级减一。
+
+5. **`PageTable::new(...)`**（第 13–20 行）只做字段打包，`phys` 直接存第 `i` 项的解码
+   地址，不额外校验对齐。
+
+### 三个参数与字段的对应
+
+| 字段 | `next` 传入的值 | 含义 |
+|------|----------------|------|
+| `base` | `entry_base(i)` | 子表覆盖的虚拟地址起点 |
+| `phys` | `entry(i).address()` | 子表所在的物理地址 |
+| `level` | `level - 1` | 层级减一 |
+
+### 为什么是 `unsafe`
+
+函数内没有越界读写（内存访问都收在 `entry`/`entry_base` 里且做了 `i < PAGE_ENTRIES`
+检查）。标 `unsafe` 是语义层面的不变量：调用者必须保证 `i` 指向的确实是一张**有效的下
+一级页表**，且返回的 `PageTable` 会被安全地用于后续访问——物理地址到虚拟地址的映射
+（`phys_to_virt`）、页表物理页本身的有效性都由调用者承担。
+
+### 在代码库中的用法
+
+`mapper.rs` 第 79 行 `visit` 里 `table = unsafe { table.next(i)? }` 下沉；`map_phys`
+第 219–231 行在缺表时先分配子表帧、`set_entry` 后 `table.next(i)?` 下沉；`unmap_phys_inner`
+第 291 行同样递归下钻；`main.rs` 第 41 行用它在 `dump_tables` 里做演示遍历。整体把「多
+级页表的逐级下钻」封成一条链式 `?`：`entry_base` 管虚拟区间、`entry` 管 PTE 读取、
+`address().ok()` 管 present 检查、`level-1` 管层级推进。
+
+---
+
 ## main.rs::new_tables（引导流程）
 
 `src/main.rs` 第 172–272 行。
@@ -732,6 +817,87 @@ TLB），手工搭了一张硬编码页表 `PML4[256]→PDP→PD→PT`，把**�
 
 `main()` 在 `new_tables` 之后还会用 `EmulateArch::read/write` 通过线性映射直接读写物理
 地址（读一个字节、写 `0x5A`、再读回），验证「虚拟地址 → 页表 → 物理内存」整条链路。
+
+### 为什么需要两个分配器（两阶段）
+
+`new_tables` 先建 `BumpAllocator`（main.rs 第 183 行），建好页表和线性映射后，再把它
+**消费**给 `BuddyAllocator::new`（main.rs 第 207 行）接管。这不是风格偏好，而是**鸡生蛋、
+蛋生鸡的循环依赖**，必须用「零元数据的 bump」先打破，再切换到「有元数据的 buddy」正式
+工作。
+
+**两者能力的对比（看结构体与签名）**
+
+`bump.rs` 的 `BumpAllocator`：
+
+```rust
+pub struct BumpAllocator<A> {
+    orig_areas: (&'static [MemoryArea], usize),  // 只存「区域切片 + 偏移」
+    cur_areas: (&'static [MemoryArea], usize),
+}
+```
+
+- `allocate` 是纯算数前进：找到一块够大的区域，`cur_areas.1 += req_size`，返回
+  `base.add(off)`。**不维护任何内存中的数据结构**，全部状态就在这几个栈字段里；
+- `free` 是 `unimplemented!("BumpAllocator::free not implemented")` —— **根本不能释放**。
+
+`buddy.rs` 的 `BuddyAllocator`：
+
+```rust
+pub struct BuddyAllocator<A> {
+    table_virt: VirtualAddress,   // 它的元数据表存在某个物理帧里
+}
+
+pub unsafe fn new(mut bump_allocator: BumpAllocator<A>) -> Option<Self> {
+    let table_phys = bump_allocator.allocate_one()?;   // ① 向 bump 要一帧放 buddy 表
+    let table_virt = A::phys_to_virt(table_phys);      // ② 依赖线性映射写这张表
+    // ③ 用 bump_allocator.offset() 跳过 bump 已发出去的帧，登记剩余空闲内存
+}
+```
+
+对比：bump 的元数据是**栈上的几个 usize**，自包含、不依赖任何已映射内存；buddy 的元数据
+是**一张存在物理内存里的表**，构造它需要两件事——分配一个物理帧放表、经 `phys_to_virt`
+写这张表。而这两件事在「页表和线性映射还没建好」时都做不到。
+
+**循环依赖链**
+
+要建正式页表，就得给每张页表分配物理帧（`PageTable` 就是一个放 PTE 的物理页）；分配物理
+帧需要一个 `FrameAllocator`。若一开始就用 buddy：
+
+```
+构造 BuddyAllocator
+  → allocate_one() 拿一帧放 buddy 表
+    → buddy 自己就是那个分配器，还没构造完，无法分配        ← 自引用死锁
+  → 写表要靠 phys_to_virt
+    → phys_to_virt 依赖 PHYS_OFFSET 线性映射已建立
+      → 线性映射是页表条目，页表又需要分配物理帧
+        → 又回到需要分配器
+```
+
+`map_phys`（mapper.rs 第 219–231 行）沿页表下钻遇缺表时也要 `self.allocator.allocate_one()`
+分配子表帧——所以**建立映射本身就需要一个能工作的分配器**。bump 能打破这个环，正因为它
+不需要元数据：纯前进游标，`allocate` 不读不写被管理的内存，所以能发出最初的页表帧。
+
+**两阶段在代码里的对应**
+
+- **阶段一（bootstrap）**：`BumpAllocator::new(areas, 0)`（第 183 行）→
+  `PageMapper::create(Kernel, &mut bump_allocator)`（第 187 行，`create` 内部分配顶表 +
+  预分配 256 个 PDP 帧）→ 循环 `map_linearly` 建立线性映射（第 189–196 行）→
+  `make_current()`（第 200 行）。这一步之后 `phys_to_virt` 才真正可用——这是 buddy 构造
+  的前置条件。
+- **阶段二（接管）**：`BuddyAllocator::new(bump_allocator)`（第 207 行）**消费** bump，
+  用 `bump_allocator.offset()`（第 204 行）算出 bump 已发出去的字节数，把**剩余**空闲
+  内存登记进 buddy 表——bump 阶段一分配出去的所有页表帧被「跳过」，buddy 只管理剩下的，
+  不会重复分配。
+
+之后第 209–231 行的 `allocate_one`/`free_one`/`allocate(16)`/`free(16)` 以及第 233 行起
+的 `map_phys`/`unmap_phys` + `free_one`，**都需要能释放**——这正是 bump 做不到
+（`free` 是 `unimplemented!()`）、buddy 能做的。
+
+**一句话总结**：bump 是 bootstrap 分配器（零元数据、纯推进、不可 free），唯一意义是在页
+表和线性映射建立之前先发出建表所需的物理帧；buddy 是正式分配器（能 free、能做伙伴合并），
+但它的元数据表自己占一个物理帧、访问它依赖 `phys_to_virt`，所以只能在阶段一完成后踩着
+bump 的剩余内存接管。`BuddyAllocator::new(bump_allocator)` 这个「buddy 构造时接受 bump」
+的签名，正是两阶段在类型系统上的交接点。
 
 ### 内存视角流程图
 
