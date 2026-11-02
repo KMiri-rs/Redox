@@ -5,3 +5,4 @@ target
 .gitlab-ci-local/
 
 miri*.log
+rustc-ice*

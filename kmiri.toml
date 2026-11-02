@@ -1,5 +1,6 @@
 page_table = true
-total_mem_size = 0x800_0000
+total_mem_size = 0x800_0000 # 128M
+stack_mem_size = 0x20_0000  # 2M
 
 [layout]
 __generic_interrupts_start = 0x20a18
